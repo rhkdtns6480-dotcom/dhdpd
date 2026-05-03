@@ -22,7 +22,22 @@ import sys
 import subprocess
 import random
 import platform
+import copy
 from collections import OrderedDict
+
+# PDF (reportlab) - 없으면 경고만 출력
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Table, TableStyle, HRFlowable)
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    REPORTLAB_OK = True
+except ImportError:
+    REPORTLAB_OK = False
 
 # ──────────────────────────────────────────────
 # DHCP 상수 (RFC 2131 / 2132)
@@ -818,7 +833,267 @@ class DHCPServer:
 # ──────────────────────────────────────────────
 # GUI
 # ──────────────────────────────────────────────
-class DHCPDApp:
+# 자동화 탭 GUI (DHCPDApp에 믹스인)
+# ──────────────────────────────────────────────
+
+class AutoTabMixin:
+    """DHCPDApp에 자동화 탭 기능 추가"""
+
+    def _init_automation(self):
+        self._engine = AutomationEngine(self)
+        self._scenario_events: list[ScenarioEvent] = []
+        self._auto_plan: dict = {}
+
+    def _build_automation_tab(self):
+        f = self.tab_auto
+        pad = {'padx': 8, 'pady': 3}
+
+        # ── 공통 설정 ──────────────────────────
+        gcommon = ttk.LabelFrame(f, text=' 공통 설정 ')
+        gcommon.pack(fill='x', padx=10, pady=(8, 4))
+
+        tk.Label(gcommon, text='실행 모드:').grid(row=0, column=0, sticky='e', **pad)
+        self.auto_mode_var = tk.StringVar(value='both')
+        for col, (val, lbl) in enumerate([('sc1','시나리오1만'), ('sc2','시나리오2만'), ('both','1→2 순차')]):
+            ttk.Radiobutton(gcommon, text=lbl, variable=self.auto_mode_var,
+                            value=val).grid(row=0, column=col+1, sticky='w', padx=4, pady=3)
+
+        tk.Label(gcommon, text='시나리오 간 대기(초):').grid(row=0, column=4, sticky='e', **pad)
+        self.between_sec_var = tk.StringVar(value='5')
+        tk.Entry(gcommon, textvariable=self.between_sec_var, width=6).grid(
+            row=0, column=5, sticky='w', **pad)
+
+        tk.Label(gcommon, text='감시 MAC (IP 재할당 확인):').grid(row=1, column=0, sticky='e', **pad)
+        self.watch_mac_var = tk.StringVar(value='')
+        tk.Entry(gcommon, textvariable=self.watch_mac_var, width=20).grid(
+            row=1, column=1, columnspan=3, sticky='w', **pad)
+        tk.Label(gcommon, text='예: aa:bb:cc:dd:ee:ff', fg='gray50').grid(
+            row=1, column=4, columnspan=2, sticky='w', **pad)
+
+        # ── 시나리오 1 ─────────────────────────
+        g1 = ttk.LabelFrame(f, text=' 시나리오 1 : DHCP 정보 변경 ')
+        g1.pack(fill='x', padx=10, pady=4)
+
+        # 변경할 DHCP 설정
+        tk.Label(g1, text='변경 Pool 시작:').grid(row=0, column=0, sticky='e', **pad)
+        self.sc1_pool_start = tk.StringVar(value='192.168.0.150')
+        tk.Entry(g1, textvariable=self.sc1_pool_start, width=16).grid(row=0, column=1, sticky='w', **pad)
+
+        tk.Label(g1, text='변경 Pool 종료:').grid(row=0, column=2, sticky='e', **pad)
+        self.sc1_pool_end = tk.StringVar(value='192.168.0.200')
+        tk.Entry(g1, textvariable=self.sc1_pool_end, width=16).grid(row=0, column=3, sticky='w', **pad)
+
+        tk.Label(g1, text='변경 GW:').grid(row=1, column=0, sticky='e', **pad)
+        self.sc1_gw = tk.StringVar(value='192.168.0.1')
+        tk.Entry(g1, textvariable=self.sc1_gw, width=16).grid(row=1, column=1, sticky='w', **pad)
+
+        tk.Label(g1, text='변경 Lease(초):').grid(row=1, column=2, sticky='e', **pad)
+        self.sc1_lease = tk.StringVar(value='3600')
+        tk.Entry(g1, textvariable=self.sc1_lease, width=10).grid(row=1, column=3, sticky='w', **pad)
+
+        tk.Label(g1, text='변경 DNS:').grid(row=2, column=0, sticky='e', **pad)
+        self.sc1_dns = tk.StringVar(value='1.1.1.1')
+        tk.Entry(g1, textvariable=self.sc1_dns, width=16).grid(row=2, column=1, sticky='w', **pad)
+
+        tk.Label(g1, text='변경 서브넷:').grid(row=2, column=2, sticky='e', **pad)
+        self.sc1_subnet = tk.StringVar(value='255.255.255.0')
+        tk.Entry(g1, textvariable=self.sc1_subnet, width=16).grid(row=2, column=3, sticky='w', **pad)
+
+        # 타이밍
+        tk.Label(g1, text='변경 시점까지 대기(초):').grid(row=3, column=0, sticky='e', **pad)
+        self.sc1_change_sec = tk.StringVar(value='10')
+        tk.Entry(g1, textvariable=self.sc1_change_sec, width=8).grid(row=3, column=1, sticky='w', **pad)
+
+        tk.Label(g1, text='원복까지 대기(초):').grid(row=3, column=2, sticky='e', **pad)
+        self.sc1_restore_sec = tk.StringVar(value='30')
+        tk.Entry(g1, textvariable=self.sc1_restore_sec, width=8).grid(row=3, column=3, sticky='w', **pad)
+
+        tk.Label(g1, text='반복 횟수:').grid(row=4, column=0, sticky='e', **pad)
+        self.sc1_cycles = tk.StringVar(value='1')
+        ttk.Spinbox(g1, textvariable=self.sc1_cycles, from_=1, to=99, width=6).grid(
+            row=4, column=1, sticky='w', **pad)
+
+        # ── 시나리오 2 ─────────────────────────
+        g2 = ttk.LabelFrame(f, text=' 시나리오 2 : DHCP 정지 / 재시작 ')
+        g2.pack(fill='x', padx=10, pady=4)
+
+        tk.Label(g2, text='정지 후 재시작까지 대기(초):').grid(row=0, column=0, sticky='e', **pad)
+        self.sc2_stop_sec = tk.StringVar(value='30')
+        tk.Entry(g2, textvariable=self.sc2_stop_sec, width=8).grid(row=0, column=1, sticky='w', **pad)
+
+        tk.Label(g2, text='전체 지속 시간:').grid(row=0, column=2, sticky='e', **pad)
+        self.sc2_duration_var = tk.StringVar(value='10')
+        sc2_dur_frame = ttk.Frame(g2)
+        sc2_dur_frame.grid(row=0, column=3, sticky='w', **pad)
+        ttk.Spinbox(sc2_dur_frame, textvariable=self.sc2_duration_var,
+                    from_=10, to=1440, increment=10, width=6).pack(side='left')
+        tk.Label(sc2_dur_frame, text='분').pack(side='left', padx=2)
+
+        tk.Label(g2, text='※ 정지/재시작을 지속 시간 내에서 반복합니다.',
+                 fg='gray50').grid(row=1, column=0, columnspan=4, sticky='w', padx=8, pady=2)
+
+        # ── 실행 버튼 & 이벤트 뷰 ──────────────
+        btn_frame = ttk.Frame(f)
+        btn_frame.pack(fill='x', padx=10, pady=6)
+
+        self.auto_start_btn = ttk.Button(btn_frame, text='▶  자동화 시작',
+                                         command=self._auto_start, width=16)
+        self.auto_start_btn.pack(side='left', padx=4)
+        self.auto_stop_btn = ttk.Button(btn_frame, text='■  중지',
+                                        command=self._auto_stop, width=10, state='disabled')
+        self.auto_stop_btn.pack(side='left', padx=4)
+        self.auto_pdf_btn = ttk.Button(btn_frame, text='PDF 리포트 저장',
+                                       command=self._save_pdf, width=16, state='disabled')
+        self.auto_pdf_btn.pack(side='left', padx=4)
+
+        self.auto_status_var = tk.StringVar(value='대기 중')
+        tk.Label(btn_frame, textvariable=self.auto_status_var,
+                 fg='gray40').pack(side='right', padx=8)
+
+        # 이벤트 테이블
+        ev_frame = ttk.Frame(f)
+        ev_frame.pack(fill='both', expand=True, padx=10, pady=(0, 8))
+
+        cols = ('ts', 'scenario', 'action', 'detail', 'result')
+        self.auto_tree = ttk.Treeview(ev_frame, columns=cols, show='headings', height=10)
+        hdrs = {'ts': ('시각', 140), 'scenario': ('시나리오', 80),
+                'action': ('액션', 120), 'detail': ('상세', 320), 'result': ('결과', 60)}
+        for col, (hdr, w) in hdrs.items():
+            self.auto_tree.heading(col, text=hdr)
+            self.auto_tree.column(col, width=w, anchor='w')
+
+        sb2 = ttk.Scrollbar(ev_frame, orient='vertical', command=self.auto_tree.yview)
+        self.auto_tree.configure(yscrollcommand=sb2.set)
+        self.auto_tree.pack(side='left', fill='both', expand=True)
+        sb2.pack(side='right', fill='y')
+
+        self.auto_tree.tag_configure('OK',   foreground='#1a7a1a')
+        self.auto_tree.tag_configure('FAIL', foreground='#cc0000')
+        self.auto_tree.tag_configure('INFO', foreground='gray50')
+
+    # ── 자동화 제어 ────────────────────────────
+    def _auto_start(self):
+        if not self.server or not self.server._running:
+            messagebox.showwarning('알림', 'DHCP 서버가 실행 중이어야 합니다.\n설정 탭에서 서버를 먼저 시작하세요.')
+            return
+        plan = self._build_plan()
+        if plan is None:
+            return
+        self._auto_plan = plan
+        self._scenario_events.clear()
+        for row in self.auto_tree.get_children():
+            self.auto_tree.delete(row)
+
+        self._engine.start(plan)
+        self.auto_start_btn.config(state='disabled')
+        self.auto_stop_btn.config(state='normal')
+        self.auto_pdf_btn.config(state='disabled')
+        self.auto_status_var.set('실행 중...')
+
+    def _auto_stop(self):
+        self._engine.stop()
+        self.auto_status_var.set('중지 요청됨...')
+
+    def _save_pdf(self):
+        if not REPORTLAB_OK:
+            messagebox.showerror('오류', 'reportlab 라이브러리가 필요합니다.\npip install reportlab')
+            return
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = f'dhcpd_scenario_report_{ts}.pdf'
+        ok = generate_pdf_report(self._scenario_events, self._auto_plan, path)
+        if ok:
+            messagebox.showinfo('완료', f'PDF 저장 완료:\n{os.path.abspath(path)}')
+            try:
+                if platform.system() == 'Windows':
+                    os.startfile(path)
+                elif platform.system() == 'Darwin':
+                    subprocess.run(['open', path])
+                else:
+                    subprocess.run(['xdg-open', path])
+            except Exception:
+                pass
+        else:
+            messagebox.showerror('오류', 'PDF 생성 실패. reportlab을 확인하세요.')
+
+    def _on_scenario_event(self, evt: ScenarioEvent):
+        self._scenario_events.append(evt)
+        self.auto_tree.insert('', 'end', values=(
+            evt.ts, evt.scenario, evt.action, evt.detail, evt.result
+        ), tags=(evt.result,))
+        self.auto_tree.yview_moveto(1.0)
+
+    def _on_automation_done(self):
+        self.auto_start_btn.config(state='normal')
+        self.auto_stop_btn.config(state='disabled')
+        self.auto_pdf_btn.config(state='normal')
+        ok   = sum(1 for e in self._scenario_events if e.result == 'OK')
+        fail = sum(1 for e in self._scenario_events if e.result == 'FAIL')
+        self.auto_status_var.set(f'완료  OK={ok}  FAIL={fail}')
+        # 서버가 중지됐을 수 있으면 버튼 상태 동기화
+        if self.server and not self.server._running:
+            self.start_btn.config(state='normal')
+            self.stop_btn.config(state='disabled')
+            self.status_var.set('■ 중지됨')
+
+    def _stop_server_silent(self):
+        """자동화 엔진에서 호출: 조용히 서버 정지"""
+        if self.server:
+            self.server.stop()
+        self.status_var.set('■ 중지됨 (자동화)')
+
+    def _start_server_silent(self):
+        """자동화 엔진에서 호출: 조용히 서버 재시작"""
+        cfg = self._get_config()
+        if cfg is None:
+            return
+        if self.server:
+            try:
+                self.server.stop()
+            except Exception:
+                pass
+        self.server = DHCPServer(cfg, self.logger, self.db,
+                                 on_lease_change=self._schedule_lease_refresh_now)
+        self.server.start()
+        self.status_var.set('▶ 실행 중 (자동화 재시작)')
+
+    def _build_plan(self) -> dict | None:
+        """GUI 입력값 → plan 딕셔너리"""
+        try:
+            plan = {
+                'mode': self.auto_mode_var.get(),
+                'between_sec': int(self.between_sec_var.get()),
+                'watch_mac': self.watch_mac_var.get().strip().lower(),
+                'sc1_change_sec': int(self.sc1_change_sec.get()),
+                'sc1_restore_sec': int(self.sc1_restore_sec.get()),
+                'sc1_cycles': int(self.sc1_cycles.get()),
+                'sc2_stop_sec': int(self.sc2_stop_sec.get()),
+                'sc2_duration_sec': int(self.sc2_duration_var.get()) * 60,
+            }
+        except ValueError as e:
+            messagebox.showerror('입력 오류', f'숫자를 확인하세요: {e}')
+            return None
+
+        # 시나리오1 변경 설정 구성
+        base = self._get_config()
+        if base is None:
+            return None
+        sc1_cfg = copy.deepcopy(base)
+        sc1_cfg['pool_start'] = self.sc1_pool_start.get().strip()
+        sc1_cfg['pool_end']   = self.sc1_pool_end.get().strip()
+        sc1_cfg['gateway']    = self.sc1_gw.get().strip()
+        sc1_cfg['lease_time'] = int(self.sc1_lease.get())
+        dns_raw = self.sc1_dns.get().strip()
+        sc1_cfg['dns'] = [d.strip() for d in dns_raw.split(',') if d.strip()]
+        sc1_cfg['subnet_mask'] = self.sc1_subnet.get().strip()
+        plan['sc1_cfg'] = sc1_cfg
+
+        return plan
+
+
+# ──────────────────────────────────────────────
+# DHCPDApp
+# ──────────────────────────────────────────────
+class DHCPDApp(AutoTabMixin):
     """Tkinter 기반 DHCPD GUI"""
 
     LOG_PATH = 'dhcpd.log'
@@ -833,9 +1108,12 @@ class DHCPDApp:
         self.logger = DHCPLogger(self.LOG_PATH)
         self.logger.add_gui_callback(self._on_log)
         self.db = LeaseDB()
+        self._scenario_events: list = []
+        self._auto_plan: dict = {}
 
         self._build_ui()
         self._load_iface_list()
+        self._init_automation()
 
     # ─── UI 구성 ───────────────────────────────
     def _build_ui(self):
@@ -845,13 +1123,16 @@ class DHCPDApp:
         self.tab_config = ttk.Frame(nb)
         self.tab_leases = ttk.Frame(nb)
         self.tab_log = ttk.Frame(nb)
+        self.tab_auto = ttk.Frame(nb)
         nb.add(self.tab_config, text='  설정 / 제어  ')
         nb.add(self.tab_leases, text='  임대 현황  ')
-        nb.add(self.tab_log, text='  로그  ')
+        nb.add(self.tab_log,    text='  로그  ')
+        nb.add(self.tab_auto,   text='  자동화 시나리오  ')
 
         self._build_config_tab()
         self._build_lease_tab()
         self._build_log_tab()
+        self._build_automation_tab()
 
         # 하단 상태바
         self.status_var = tk.StringVar(value='■ 중지됨')
@@ -1145,6 +1426,338 @@ class DHCPDApp:
                 subprocess.run(['xdg-open', self.LOG_PATH])
         except Exception as e:
             messagebox.showerror('오류', f'로그 파일을 열 수 없습니다: {e}')
+
+
+# ──────────────────────────────────────────────
+# 자동화 시나리오 엔진
+# ──────────────────────────────────────────────
+
+class ScenarioEvent:
+    """시나리오 실행 중 발생한 이벤트 기록"""
+    def __init__(self, ts: str, scenario: str, action: str, detail: str, result: str):
+        self.ts = ts
+        self.scenario = scenario
+        self.action = action
+        self.detail = detail
+        self.result = result  # 'OK' / 'FAIL' / 'INFO'
+
+
+class AutomationEngine:
+    """
+    시나리오 1: DHCP 정보 변경 (변경 → 주기 후 원복)
+    시나리오 2: DHCP 정지/재시작 (Stop → 대기 → Start 반복)
+    공통: 감시 MAC IP 재할당 확인, 결과 이벤트 기록
+    """
+
+    def __init__(self, app: 'DHCPDApp'):
+        self.app = app
+        self._thread: threading.Thread | None = None
+        self._stop_evt = threading.Event()
+        self.events: list[ScenarioEvent] = []
+        self._lock = threading.Lock()
+
+    # ── 공개 API ──────────────────────────────
+    def start(self, plan: dict):
+        """plan 딕셔너리에 따라 시나리오 실행 스레드 시작"""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_evt.clear()
+        self.events.clear()
+        self._thread = threading.Thread(target=self._run, args=(plan,), daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    # ── 내부 실행 ─────────────────────────────
+    def _run(self, plan: dict):
+        self._log('INFO', 'SYSTEM', '자동화 시작', f'모드={plan["mode"]}', 'INFO')
+        try:
+            mode = plan['mode']
+            if mode == 'sc1':
+                self._run_sc1(plan)
+            elif mode == 'sc2':
+                self._run_sc2(plan)
+            elif mode == 'both':
+                self._run_sc1(plan)
+                if not self._stop_evt.is_set():
+                    self._sleep(plan.get('between_sec', 5))
+                if not self._stop_evt.is_set():
+                    self._run_sc2(plan)
+        except Exception as e:
+            self._log('ERROR', 'SYSTEM', '예외 발생', str(e), 'FAIL')
+        finally:
+            self._log('INFO', 'SYSTEM', '자동화 종료', '', 'INFO')
+            self.app.root.after(0, self.app._on_automation_done)
+
+    # ── 시나리오 1: 정보 변경 ─────────────────
+    def _run_sc1(self, plan: dict):
+        """변경 설정 적용 → wait → 원복 → (반복 주기만큼 대기)"""
+        original_cfg = copy.deepcopy(self.app.server.config) if self.app.server else None
+        changed_cfg  = plan['sc1_cfg']
+        change_sec   = plan['sc1_change_sec']    # 변경 시점까지 대기
+        restore_sec  = plan['sc1_restore_sec']   # 원복까지 대기
+        cycles       = plan.get('sc1_cycles', 1)
+        watch_mac    = plan.get('watch_mac', '').strip().lower()
+
+        for cycle in range(1, cycles + 1):
+            if self._stop_evt.is_set():
+                break
+            self._log('INFO', 'SC1', f'사이클 {cycle}/{cycles}', '변경 대기 시작', 'INFO')
+
+            # 변경 시점까지 대기
+            self._sleep(change_sec)
+            if self._stop_evt.is_set():
+                break
+
+            # 설정 변경 적용
+            self._apply_config(changed_cfg, 'SC1', f'사이클{cycle} 설정 변경')
+
+            # 감시 MAC IP 재할당 확인
+            if watch_mac:
+                self._sleep(3)
+                self._check_mac_lease(watch_mac, 'SC1', f'사이클{cycle} 변경 후')
+
+            # 원복 대기
+            self._sleep(restore_sec)
+            if self._stop_evt.is_set():
+                break
+
+            # 원복
+            if original_cfg:
+                self._apply_config(original_cfg, 'SC1', f'사이클{cycle} 원복')
+                if watch_mac:
+                    self._sleep(3)
+                    self._check_mac_lease(watch_mac, 'SC1', f'사이클{cycle} 원복 후')
+
+    # ── 시나리오 2: 정지/재시작 ───────────────
+    def _run_sc2(self, plan: dict):
+        """Stop → wait → Start 반복, 지속 시간 내"""
+        stop_wait_sec  = plan['sc2_stop_sec']    # 정지 후 재시작까지 대기
+        duration_sec   = plan['sc2_duration_sec'] # 전체 지속 시간
+        watch_mac      = plan.get('watch_mac', '').strip().lower()
+
+        deadline = time.time() + duration_sec
+        cycle = 0
+
+        while not self._stop_evt.is_set() and time.time() < deadline:
+            cycle += 1
+            remain = int(deadline - time.time())
+            self._log('INFO', 'SC2', f'사이클 {cycle}',
+                      f'서버 정지  (남은 시간 {remain}s)', 'INFO')
+
+            # 서버 정지
+            self.app.root.after(0, self.app._stop_server_silent)
+            self._sleep(1)
+
+            # 정지 중 감시 MAC 확인 (할당 불가 상태)
+            if watch_mac:
+                self._check_mac_lease(watch_mac, 'SC2', f'사이클{cycle} 정지 중', expect_fail=True)
+
+            # 재시작까지 대기
+            self._sleep(stop_wait_sec)
+            if self._stop_evt.is_set() or time.time() >= deadline:
+                break
+
+            # 서버 재시작
+            self._log('INFO', 'SC2', f'사이클 {cycle}', '서버 재시작', 'INFO')
+            self.app.root.after(0, self.app._start_server_silent)
+            self._sleep(3)  # 소켓 바인딩 안정화
+
+            # 재시작 후 감시 MAC 확인
+            if watch_mac:
+                self._sleep(2)
+                self._check_mac_lease(watch_mac, 'SC2', f'사이클{cycle} 재시작 후')
+
+            # 다음 사이클까지 남은 시간 대기 (최소 5초)
+            next_wait = max(5, min(30, int(deadline - time.time()) // 2))
+            self._sleep(next_wait)
+
+    # ── 헬퍼 ─────────────────────────────────
+    def _apply_config(self, cfg: dict, scenario: str, label: str):
+        """서버에 새 설정 적용 (재시작)"""
+        def _do():
+            try:
+                if self.app.server and self.app.server._running:
+                    self.app.server.stop()
+                    time.sleep(0.5)
+                self.app.server = DHCPServer(
+                    cfg, self.app.logger, self.app.db,
+                    on_lease_change=self.app._schedule_lease_refresh_now
+                )
+                self.app.server.start()
+            except Exception as e:
+                self._log('ERROR', scenario, label, str(e), 'FAIL')
+                return
+            self._log('INFO', scenario, label,
+                      f'Pool={cfg.get("pool_start")}~{cfg.get("pool_end")}  '
+                      f'GW={cfg.get("gateway")}  Lease={cfg.get("lease_time")}s', 'OK')
+        self.app.root.after(0, _do)
+        time.sleep(0.8)
+
+    def _check_mac_lease(self, mac: str, scenario: str, label: str, expect_fail: bool = False):
+        """감시 MAC의 IP 할당 여부 확인"""
+        lease = self.app.db.get_by_mac(mac)
+        if lease and lease.state == LeaseState.LEASED:
+            result = 'FAIL' if expect_fail else 'OK'
+            self._log('INFO', scenario, label,
+                      f'MAC {mac} → IP {lease.ip} ({lease.state})', result)
+        else:
+            result = 'OK' if expect_fail else 'FAIL'
+            self._log('INFO', scenario, label,
+                      f'MAC {mac} → 미할당', result)
+
+    def _sleep(self, sec: float):
+        """stop 이벤트 감시하며 sleep"""
+        step = 0.5
+        elapsed = 0.0
+        while elapsed < sec and not self._stop_evt.is_set():
+            time.sleep(min(step, sec - elapsed))
+            elapsed += step
+
+    def _log(self, level: str, scenario: str, action: str, detail: str, result: str):
+        ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        evt = ScenarioEvent(ts, scenario, action, detail, result)
+        with self._lock:
+            self.events.append(evt)
+        self.app.logger.info(f'[AUTO][{scenario}] {action} | {detail} | {result}')
+        self.app.root.after(0, lambda e=evt: self.app._on_scenario_event(e))
+
+
+# ──────────────────────────────────────────────
+# PDF 리포트 생성
+# ──────────────────────────────────────────────
+
+def generate_pdf_report(events: list[ScenarioEvent], plan: dict, path: str) -> bool:
+    """reportlab으로 시나리오 결과 PDF 생성"""
+    if not REPORTLAB_OK:
+        return False
+
+    doc = SimpleDocTemplate(
+        path, pagesize=A4,
+        leftMargin=20*mm, rightMargin=20*mm,
+        topMargin=20*mm, bottomMargin=20*mm
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('title', fontSize=18, spaceAfter=6,
+                                  textColor=colors.HexColor('#1a1a2e'), fontName='Helvetica-Bold')
+    head2_style = ParagraphStyle('h2', fontSize=13, spaceBefore=10, spaceAfter=4,
+                                  textColor=colors.HexColor('#185FA5'), fontName='Helvetica-Bold')
+    body_style  = ParagraphStyle('body', fontSize=9, leading=14, fontName='Helvetica')
+    small_style = ParagraphStyle('small', fontSize=8, leading=12,
+                                  textColor=colors.HexColor('#555555'), fontName='Helvetica')
+
+    story = []
+
+    # ── 제목 ──
+    now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    story.append(Paragraph('DHCPD 자동화 시나리오 결과 리포트', title_style))
+    story.append(Paragraph(f'생성 일시: {now_str}', small_style))
+    story.append(HRFlowable(width='100%', thickness=1, color=colors.HexColor('#185FA5')))
+    story.append(Spacer(1, 6*mm))
+
+    # ── 시나리오 설정 요약 ──
+    story.append(Paragraph('1. 시나리오 설정 요약', head2_style))
+    mode_label = {'sc1': '시나리오 1 (정보 변경)', 'sc2': '시나리오 2 (정지/재시작)',
+                  'both': '시나리오 1 → 2 순차 실행'}.get(plan.get('mode', ''), '-')
+    summary_data = [
+        ['항목', '값'],
+        ['실행 모드', mode_label],
+        ['감시 MAC', plan.get('watch_mac', '-') or '-'],
+    ]
+    if plan.get('mode') in ('sc1', 'both'):
+        summary_data += [
+            ['[SC1] 변경 대기 시간', f'{plan.get("sc1_change_sec", 0)}초'],
+            ['[SC1] 원복 대기 시간', f'{plan.get("sc1_restore_sec", 0)}초'],
+            ['[SC1] 반복 횟수', f'{plan.get("sc1_cycles", 1)}회'],
+        ]
+    if plan.get('mode') in ('sc2', 'both'):
+        summary_data += [
+            ['[SC2] 정지→재시작 대기', f'{plan.get("sc2_stop_sec", 0)}초'],
+            ['[SC2] 전체 지속 시간', f'{plan.get("sc2_duration_sec", 0)}초'],
+        ]
+
+    tbl = Table(summary_data, colWidths=[60*mm, 110*mm])
+    tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#185FA5')),
+        ('TEXTCOLOR',  (0,0), (-1,0), colors.white),
+        ('FONTNAME',   (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE',   (0,0), (-1,-1), 9),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1),
+         [colors.HexColor('#F5F5F5'), colors.white]),
+        ('GRID', (0,0), (-1,-1), 0.4, colors.HexColor('#CCCCCC')),
+        ('TOPPADDING', (0,0), (-1,-1), 4),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+    ]))
+    story.append(tbl)
+    story.append(Spacer(1, 6*mm))
+
+    # ── 이벤트 통계 ──
+    story.append(Paragraph('2. 결과 통계', head2_style))
+    total  = len(events)
+    ok     = sum(1 for e in events if e.result == 'OK')
+    fail   = sum(1 for e in events if e.result == 'FAIL')
+    info   = sum(1 for e in events if e.result == 'INFO')
+    rate   = f'{ok/total*100:.1f}%' if total else '-'
+
+    stat_data = [
+        ['전체 이벤트', 'OK', 'FAIL', 'INFO', '성공률'],
+        [str(total), str(ok), str(fail), str(info), rate],
+    ]
+    stbl = Table(stat_data, colWidths=[34*mm]*5)
+    stbl.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1D9E75')),
+        ('TEXTCOLOR',  (0,0), (-1,0), colors.white),
+        ('FONTNAME',   (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE',   (0,0), (-1,-1), 9),
+        ('ALIGN',      (0,0), (-1,-1), 'CENTER'),
+        ('GRID', (0,0), (-1,-1), 0.4, colors.HexColor('#CCCCCC')),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+        ('BACKGROUND', (2,1), (2,1), colors.HexColor('#FFF0F0') if fail else colors.white),
+    ]))
+    story.append(stbl)
+    story.append(Spacer(1, 6*mm))
+
+    # ── 이벤트 상세 ──
+    story.append(Paragraph('3. 이벤트 상세 로그', head2_style))
+    ev_data = [['시각', '시나리오', '액션', '상세', '결과']]
+    for e in events:
+        color_map = {'OK': colors.HexColor('#1D9E75'),
+                     'FAIL': colors.HexColor('#CC0000'),
+                     'INFO': colors.HexColor('#888888')}
+        ev_data.append([e.ts, e.scenario, e.action,
+                        Paragraph(e.detail, small_style), e.result])
+
+    etbl = Table(ev_data, colWidths=[32*mm, 16*mm, 28*mm, 72*mm, 14*mm])
+    ev_style = [
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#444441')),
+        ('TEXTCOLOR',  (0,0), (-1,0), colors.white),
+        ('FONTNAME',   (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE',   (0,0), (-1,-1), 8),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1),
+         [colors.HexColor('#FAFAFA'), colors.white]),
+        ('GRID', (0,0), (-1,-1), 0.3, colors.HexColor('#DDDDDD')),
+        ('TOPPADDING', (0,0), (-1,-1), 3),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+    ]
+    # 결과 셀 색상
+    for i, e in enumerate(events, start=1):
+        if e.result == 'OK':
+            ev_style.append(('TEXTCOLOR', (4,i), (4,i), colors.HexColor('#1D9E75')))
+        elif e.result == 'FAIL':
+            ev_style.append(('TEXTCOLOR', (4,i), (4,i), colors.HexColor('#CC0000')))
+
+    etbl.setStyle(TableStyle(ev_style))
+    story.append(etbl)
+
+    doc.build(story)
+    return True
 
 
 # ──────────────────────────────────────────────
